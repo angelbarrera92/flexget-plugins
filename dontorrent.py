@@ -1,29 +1,14 @@
 import re
-from unicodedata import normalize
 
 from loguru import logger
 
 from flexget import plugin
-from flexget.components.sites.utils import torrent_availability
 from flexget.entry import Entry
 from flexget.event import event
 from flexget.utils.requests import RequestException
 from flexget.utils.soup import get_soup
-from flexget.utils.tools import parse_filesize
 
 logger = logger.bind(name='dontorrent')
-
-
-def clean_symbols(text):
-    """Replaces common symbols with spaces. Also normalize unicode strings in decomposed form."""
-    result = text
-    if isinstance(result, str):
-        result = normalize('NFKD', result)
-    result = re.sub(r'[ \(\)\-_\[\]\.]+', ' ', result).lower()
-
-    # Leftovers
-    result = re.sub(r"[^a-zA-Z0-9 ]", "", result)
-    return result
 
 
 class DonTorrent:
@@ -33,7 +18,7 @@ class DonTorrent:
 
     schema = {'type': 'boolean', 'default': False}
 
-    base_url = 'https://www.dontorrent.in/'
+    base_url = 'https://www.dontorrent.in'
     errors = False
 
     @plugin.internet(logger)
@@ -42,73 +27,82 @@ class DonTorrent:
         Search for entries on DonTorrent
         """
 
-        if not isinstance(config, dict):
-            config = {'category': config}
-
-        order_by = ''
-        if isinstance(config.get('order_by'), str):
-            if config['order_by'] != 'date':
-                order_by = '{0}/1'.format(config['order_by'])
-
-        category = 'all'
-        if isinstance(config.get('category'), str):
-            category = '{0}'.format(config['category'])
-
         entries = set()
+        logger.debug('Using DonTorrent!')
 
         for search_string in entry.get('search_strings', [entry['title']]):
-            # No special characters - use dashes instead of %20
-            cleaned_search_string = clean_symbols(search_string).replace(' ', '-')
+            logger.debug('Search string: {}', search_string)
+            # Remove characters after the last space
+            # As the search engine is not very good
+            cleaned_search_string = re.sub(r'(?<=\s)\S*$', '', search_string)
+            logger.debug('Using search: {}', cleaned_search_string)
 
-            query = 'search/{0}/{1}/{2}'.format(
-                category, cleaned_search_string.encode('utf8'), order_by
-            )
-            logger.debug(
-                'Using search: {}; category: {}; ordering: {}',
-                cleaned_search_string,
-                category,
-                order_by or 'default',
-            )
+            query = '/buscar/{0}'.format(cleaned_search_string)
+            pageURL = self.base_url + query
+
             try:
+                logger.debug('requesting: {}', pageURL)
                 page = task.requests.get(self.base_url + query)
-                logger.debug('requesting: {}', page.url)
             except RequestException as e:
                 logger.error('DonTorrent request failed: {}', e)
                 continue
 
             soup = get_soup(page.content)
-            if soup.find('a', attrs={'class': 'csprite_dl14'}) is not None:
-                for link in soup.findAll('a', attrs={'class': 'csprite_dl14'}):
 
-                    row = link.find_parent('tr')
-                    info_url = str(link.get('href'))
+            cardBody = soup.find('div', attrs={'class': 'card-body'})
+            # Get p elements without class (Every result is in a p element)
+            pElements = cardBody.find_all('p', attrs={'class': False})
+            # For each result
+            for pElement in pElements:
+                # Get the first span element
+                spanElement = pElement.find('span')
+                # Get the link with class text-decoration-none
+                aElement = spanElement.find('a', attrs={'class': 'text-decoration-none'})
+                href = aElement.get('href')
+               
+                if 'serie' in href:
+                    qualitySpanElement = spanElement.find('span')
+                    title = aElement.text
+                    quality = qualitySpanElement.text
+                    
+                    pageURL = self.base_url + href
+                    try:
+                        logger.debug('requesting: {}', pageURL)
+                        page = task.requests.get(self.base_url + href)
+                    except RequestException as e:
+                        logger.error('DonTorrent request failed: {}', e)
+                        continue
 
-                    # Get the title from the URL as it's complete versus the actual Title text which gets cut off
-                    title = str(link.next_sibling.get('href'))
-                    title = title[: title.rfind('-torrent')].replace('-', ' ')
-                    title = title[1:]
+                    soup = get_soup(page.content)
 
-                    data = row.findAll('td', attrs={'class': 'tdnormal'})
-                    size = str(data[1].text).replace(',', '')
+                    # Get the list of episodes from the table in the page
+                    for tr in soup.find('tbody').findAll('tr'):
+                        # Episode id is in the first td text
+                        episode = tr.find('td').text
+                        # Then get the link to the torrent
+                        link = tr.find('a', attrs={'class': 'text-white bg-primary rounded-pill d-block shadow-sm text-decoration-none my-1 py-1'})
+                        url = link.get('href')
+                        logger.debug('Found torrent link: {}', url)
+                        # If the url does not starts with http nor https, append https
+                        if not url.startswith('http'):
+                            url = 'https:' + url
+                            logger.debug('Formatted torrent link: {}', url)
+                        
+                        # Set the title of the entry
+                        epTitle = title + ' ' + episode + ' ' + quality
 
-                    seeds = int(row.find('td', attrs={'class': 'tdseed'}).text.replace(',', ''))
-                    leeches = int(row.find('td', attrs={'class': 'tdleech'}).text.replace(',', ''))
+                        e = Entry()
 
-                    size = parse_filesize(size)
+                        e['url'] = url
+                        e['title'] = epTitle
+                        e['quality'] = quality
 
-                    e = Entry()
+                        logger.debug('Found entry: {}', e)
 
-                    e['url'] = info_url
-                    e['title'] = title
-                    e['torrent_seeds'] = seeds
-                    e['torrent_leeches'] = leeches
-                    e['torrent_availability'] = torrent_availability(
-                        e['torrent_seeds'], e['torrent_leeches']
-                    )
-                    e['content_size'] = size
-
-                    entries.add(e)
-
+                        entries.add(e)
+                else:
+                    logger.warning('Not a series link: {}', href)
+                    logger.warning('Skipping...')
         return entries
 
 
